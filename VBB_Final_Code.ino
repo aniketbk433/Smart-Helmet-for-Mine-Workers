@@ -1,0 +1,180 @@
+/*****************
+### This is for whom who are being exploited and not taken care due to the work. But they play important role in our lifestyle. ###
+ * Program: Dual Gas Detection using MQ-7 and MQ-4 and Fall Detection From MPU6050
+ * Function:
+ * - MQ-7 monitors Carbon Monoxide (CO)
+ * - MQ-4 monitors Methane (CH4)
+ * - If Methane or CO exceeds upper limit, an alarm is triggered
+ * - Uses log-log calculations from datasheets for more accurate PPM.
+ * - MPU6050 detects fall or slip based on acceleration and tilt angle.
+ *****************/
+
+#include <math.h>
+#include <Wire.h>
+#include <MPU6050.h>
+
+// MPU6050:
+MPU6050 mpu;
+const float ACC_THRESHOLD = 2.3;
+const float ANGLE_THRESHOLD = 45;
+
+// --- Sensor Pins ---
+const int MQ7_PIN = A0;
+const int MQ4_PIN = A1;
+const int BUZZER_PIN = 7;
+
+// --- Safety Limits (ppm) ---
+const float METHANE_SAFE_LIMIT = 2000.0;
+const float CO_ALERT_LEVEL = 15.0;
+
+// --- MQ-4 (Methane) constants ---
+const float MQ4_RL_VALUE = 5000.0;
+const float MQ4_AIR_RATIO = 4.4;
+const float MQ4_M = -0.36;
+const float MQ4_C = 0.32;
+
+// --- MQ-7 (CO) constants ---
+const float MQ7_RL_VALUE = 1000.0;
+const float MQ7_AIR_RATIO = 25.0;
+const float MQ7_M = -1.478;
+const float MQ7_C = 1.699;
+
+// --- Global Variables ---
+float Ro_MQ4;
+float Ro_MQ7;
+
+void setup() {
+  Serial.begin(9600);
+  pinMode(BUZZER_PIN, OUTPUT);
+  digitalWrite(BUZZER_PIN, LOW);
+
+  Serial.println("Gas Monitoring System Initializing...");
+  Serial.println("Sensors warming up for 15 seconds...");
+
+  for (int i = 15; i > 0; i--) {
+    Serial.print(i);
+    Serial.print("... ");
+    delay(1000);
+  }
+  Serial.println("Warm-up complete.");
+
+  Serial.println("Calibrating MQ-4 (Methane)...");
+  Ro_MQ4 = calibrateSensor(MQ4_PIN, MQ4_RL_VALUE, MQ4_AIR_RATIO);
+  Serial.print("MQ-4 Ro = ");
+  Serial.println(Ro_MQ4);
+
+  Serial.println("Calibrating MQ-7 (CO)...");
+  Ro_MQ7 = calibrateSensor(MQ7_PIN, MQ7_RL_VALUE, MQ7_AIR_RATIO);
+  Serial.print("MQ-7 Ro = ");
+  Serial.println(Ro_MQ7);
+
+  Serial.println("Calibration complete. Starting monitoring.");
+  Serial.println("------------------------------------------");
+
+  // MPU6050 INIT
+  Wire.begin();
+  mpu.initialize();
+  if (!mpu.testConnection()) {
+    Serial.println("MPU6050 connection failed!");
+    while (1);
+  }
+  Serial.println("MPU6050 Fall Detection System Initialized.....");
+}
+
+void loop() {
+
+  // Read Rs
+  float rs_mq4 = getSensorRs(MQ4_PIN, MQ4_RL_VALUE);
+  float rs_mq7 = getSensorRs(MQ7_PIN, MQ7_RL_VALUE);
+
+  // Compute PPM
+  float methanePPM = getPPM_LogLog(rs_mq4, Ro_MQ4, MQ4_M, MQ4_C);
+  float coPPM = getPPM_LogLog(rs_mq7, Ro_MQ7, MQ7_M, MQ7_C);
+
+  Serial.print("CO (MQ-7): ");
+  Serial.print(coPPM, 2);
+  Serial.print(" ppm | CH4 (MQ-4): ");
+  Serial.print(methanePPM, 2);
+  Serial.println(" ppm");
+
+  // MPU6050 DATA
+  int16_t ax, ay, az;
+  mpu.getAcceleration(&ax, &ay, &az);
+
+  float accelX = ax / 16384.0;
+  float accelY = ay / 16384.0;
+  float accelZ = az / 16384.0;
+
+  float totalAcc = sqrt(accelX*accelX + accelY*accelY + accelZ*accelZ);
+
+  float angleX = atan(accelX / sqrt(accelY*accelY + accelZ*accelZ)) * (180.0 / PI);
+  float angleY = atan(accelY / sqrt(accelX*accelX + accelZ*accelZ)) * (180.0 / PI);
+
+  Serial.print("Accel (g): X=");
+  Serial.print(accelX, 2);
+  Serial.print(" Y=");
+  Serial.print(accelY, 2);
+  Serial.print(" Z=");
+  Serial.print(accelZ, 2);
+  Serial.print(" | Total Acc: ");
+  Serial.print(totalAcc, 2);
+  Serial.print("g | AngleX: ");
+  Serial.print(angleX, 1);
+  Serial.print("°, AngleY: ");
+  Serial.println(angleY, 1);
+
+  bool fallDetected = false;
+  if (totalAcc > ACC_THRESHOLD || abs(angleX) > ANGLE_THRESHOLD || abs(angleY) > ANGLE_THRESHOLD) {
+    Serial.println("ALERT: Fall or Slip Detected!");
+    fallDetected = true;
+  }
+
+  // -----------------------------
+  // GAS ALARM PRINT FIX ADDED ✔
+  // -----------------------------
+  bool gasAlarm = (methanePPM > METHANE_SAFE_LIMIT) || (coPPM > CO_ALERT_LEVEL);
+
+  if (gasAlarm) {
+    Serial.println("ALERT: Gas Level Exceeded Safety Limit!");
+  }
+
+  if (gasAlarm || fallDetected) {
+    digitalWrite(BUZZER_PIN, HIGH);
+  } else {
+    digitalWrite(BUZZER_PIN, LOW);
+  }
+
+  Serial.println("------------------------------------------");
+  delay(2000);
+}
+
+// ---------------- Helper Functions ----------------
+
+float getSensorRs(int pin, float rl_value) {
+  int sensorValue = analogRead(pin);
+  float sensorVoltage = (sensorValue / 1023.0) * 5.0;
+  if (sensorVoltage <= 0) return 0;
+  return ((5.0 - sensorVoltage) / sensorVoltage) * rl_value;
+}
+
+float getPPM_LogLog(float rs, float ro, float m, float c) {
+  if (rs <= 0 || ro <= 0) return 0;
+  float ratio = rs / ro;
+  float log_ratio = log10(ratio);
+  float log_ppm = (log_ratio - c) / m;
+  return pow(10, log_ppm);
+}
+
+float calibrateSensor(int pin, float rl_value, float air_ratio) {
+  float rs_sum = 0.0;
+  int readings = 50;
+
+  for (int i = 0; i < readings; i++) {
+    rs_sum += getSensorRs(pin, rl_value);
+    delay(100);
+  }
+
+  float rs_clean_air = rs_sum / readings;
+  float ro = rs_clean_air / air_ratio;
+  return ro;
+}
